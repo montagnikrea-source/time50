@@ -1,0 +1,563 @@
+package com.example.qpcsync;
+
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.widget.TextView;
+import androidx.appcompat.app.AppCompatActivity;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+public class MainActivity extends AppCompatActivity {
+    private TextView telemetryView;
+    private NTP ntp;
+    private QpcSensor qpc;
+    private MainsEstimator mains;
+    private PLL pll;
+    private EnvStats env;
+    private Telemetry tlm;
+    private Handler handler;
+    private volatile boolean running = true;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+        telemetryView = findViewById(R.id.telemetry_view);
+        ntp = new NTP();
+        qpc = new QpcSensor();
+        mains = new MainsEstimator();
+        pll = new PLL();
+        env = new EnvStats();
+        tlm = new Telemetry();
+        handler = new Handler(Looper.getMainLooper());
+        qpc.init();
+        pll.init();
+        ntp.start();
+        startControlThread();
+        startTelemetryUpdate();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        running = false;
+        ntp.stop();
+    }
+
+    private void startControlThread() {
+        new Thread(() -> {
+            long last = System.nanoTime();
+            double prevOffMs = 0.0;
+            double prevTS = 0.0;
+            boolean havePrev = false;
+            while (running) {
+                try {
+                    long now = System.nanoTime();
+                    double dtS = (now - last) / 1_000_000_000.0;
+                    if (dtS <= 0) dtS = 0.02;
+                    last = now;
+
+                    qpc.sampleFast();
+                    qpc.dspTick();
+                    mains.feed(qpc.phi, qpc.mains, qpc.conf, qpc.mag1, dtS);
+                    double phiRef = mains.locked && mains.quality >= 0.70 ? mains.virtPhi : qpc.phi;
+                    boolean ntpOk = ntp.locked;
+                    double e = pll.tick(phiRef, qpc.mains, ntpOk, ntp.offsetMs);
+                    double tNowS = System.currentTimeMillis() / 1000.0;
+                    double offMs = ntp.offsetMs;
+                    double slopePpm = 0.0;
+                    if (havePrev) {
+                        double dOff = offMs - prevOffMs;
+                        double dT = tNowS - prevTS;
+                        if (dT > 0.2 && dT < 8.0) {
+                            slopePpm = (dOff / dT) * 1000.0;
+                        }
+                    }
+                    prevOffMs = offMs;
+                    prevTS = tNowS;
+                    havePrev = true;
+                    env.push(e, qpc.mag1, qpc.conf);
+                    autoTuneTick();
+
+                    synchronized (tlm) {
+                        tlm.mains = qpc.mains;
+                        tlm.conf = qpc.conf;
+                        tlm.phi = phiRef;
+                        tlm.mag1 = qpc.mag1;
+                        tlm.mag2 = qpc.mag2;
+                        tlm.eMs = e;
+                        tlm.ppm = pll.livePpb / 1000.0;
+                        tlm.ntpOk = ntpOk;
+                        tlm.ntpMs = ntp.offsetMs;
+                        tlm.kp = pll.kp;
+                        tlm.ki = pll.ki;
+                        tlm.dead = pll.deadMs;
+                        tlm.cap = pll.capPpm;
+                        tlm.slew = pll.slewPpmS;
+                        tlm.wS = pll.wSensor;
+                        tlm.wN = pll.wNtp;
+                    }
+                    Thread.sleep(20);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        }).start();
+    }
+
+    private void startTelemetryUpdate() {
+        handler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (!running) return;
+                synchronized (tlm) {
+                    String grid = String.format("GRID:%s %.1f s (Q=%.2f)",
+                            mains.locked ? "LOCKED" : "TRACK", mains.accumulatedS, mains.quality);
+                    String text = String.format(
+                            "Mains: %dHz conf=%.2f e=%.3f ms ppm=%.1f\n" +
+                                    "NTP:%s off=%.2f ms δ=%.1f ms σ=%.2f ms strat=%d host=%s\n" +
+                                    "%s\nKp=%.3f Ki=%.3f Dead=%.2f Cap=%.0f Slew=%.0f W(S/N)=%.2f/%.2f",
+                            tlm.mains, tlm.conf, tlm.eMs, tlm.ppm,
+                            tlm.ntpOk ? "OK" : "--", tlm.ntpMs, ntp.delayMs, ntp.dispMs, ntp.stratum, ntp.activeHost,
+                            grid, tlm.kp, tlm.ki, tlm.dead, tlm.cap, tlm.slew, tlm.wS, tlm.wN);
+                    telemetryView.setText(text);
+                }
+                handler.postDelayed(this, 100);
+            }
+        });
+    }
+
+    private void autoTuneTick() {
+        double mag = env.magEma, conf = env.confEma, rms = env.rms();
+        double kp, ki, dead, cap, slew;
+        if (mag < 0.0015 && conf > 0.75 && rms < 0.3) {
+            kp = 0.08; ki = 0.010; dead = 0.15; cap = 1500; slew = 120;
+        } else if (mag > 0.004 || conf < 0.60 || rms > 0.7) {
+            kp = 0.22; ki = 0.035; dead = 0.08; cap = 2500; slew = 220;
+        } else {
+            kp = 0.15; ki = 0.020; dead = 0.10; cap = 2000; slew = 180;
+        }
+        if (rms < 0.15 && conf > 0.8) {
+            kp *= 0.9; ki *= 0.9; dead *= 1.1; slew *= 0.9;
+        }
+        if (rms > 1.0) {
+            kp *= 1.15; ki *= 1.15; dead *= 0.9;
+        }
+        double a = 0.12;
+        pll.kp = (1.0 - a) * pll.kp + a * kp;
+        pll.ki = (1.0 - a) * pll.ki + a * ki;
+        pll.deadMs = (1.0 - a) * pll.deadMs + a * dead;
+        pll.capPpm = (1.0 - a) * pll.capPpm + a * cap;
+        pll.slewPpmS = (1.0 - a) * pll.slewPpmS + a * slew;
+    }
+
+    static class NTP {
+        volatile boolean enabled = true;
+        List<String> hosts = Arrays.asList("ru.pool.ntp.org", "europe.pool.ntp.org", "pool.ntp.org",
+                "time.google.com", "time.cloudflare.com", "time.windows.com", "time.nist.gov");
+        volatile double offsetMs = 0.0, delayMs = 0.0, dispMs = 0.0;
+        volatile long lastOk = 0;
+        volatile int stratum = 0, leap = 0;
+        volatile boolean locked = false;
+        String activeHost = "";
+        Thread thread;
+        Sample[] filt = new Sample[8];
+        int head = 0;
+
+        static class Sample {
+            double offMs = 0, delMs = 1e9, ts = 0;
+            String host = "";
+        }
+
+        static long toNtpTs(double secUnix) {
+            final double NTP_UNIX = 2208988800.0;
+            double s = secUnix + NTP_UNIX;
+            long sec = (long) Math.floor(s);
+            long frac = (long) Math.floor((s - Math.floor(s)) * 4294967296.0);
+            return (sec << 32) | frac;
+        }
+
+        static double fromNtpTs(long ntp) {
+            final double NTP_UNIX = 2208988800.0;
+            long sec = (ntp >> 32) & 0xffffffffL;
+            long frac = ntp & 0xffffffffL;
+            return sec + frac / 4294967296.0 - NTP_UNIX;
+        }
+
+        void pushFilter(double offMs, double delMs, String host) {
+            head = (head + 1) & 7;
+            filt[head] = new Sample();
+            filt[head].offMs = offMs;
+            filt[head].delMs = delMs;
+            filt[head].ts = System.currentTimeMillis();
+            filt[head].host = host;
+            int best = head;
+            for (int i = 0; i < 8; i++) {
+                if (filt[i].delMs < filt[best].delMs) best = i;
+            }
+            offsetMs = filt[best].offMs;
+            delayMs = filt[best].delMs;
+            activeHost = filt[best].host;
+            double m = 0, cnt = 0;
+            for (int i = 0; i < 8; i++) {
+                if (filt[i].delMs < 1e8) {
+                    m += filt[i].offMs;
+                    cnt++;
+                }
+            }
+            if (cnt < 1) cnt = 1;
+            m /= cnt;
+            double s2 = 0;
+            for (int i = 0; i < 8; i++) {
+                if (filt[i].delMs < 1e8) {
+                    double d = filt[i].offMs - m;
+                    s2 += d * d;
+                }
+            }
+            dispMs = Math.sqrt(s2 / cnt);
+        }
+
+        boolean queryOneAddr(String host, double[] thetaMs, double[] delayMs, int[] stratum, int[] leap) {
+            try (DatagramSocket socket = new DatagramSocket()) {
+                socket.setSoTimeout(1000);
+                InetAddress addr = InetAddress.getByName(host);
+                byte[] pkt = new byte[48];
+                pkt[0] = 0b00100011; // LI=0 VN=4 MODE=3
+                double t1u = System.currentTimeMillis() / 1000.0;
+                long t1 = toNtpTs(t1u);
+                ByteBuffer.wrap(pkt, 40, 8).putLong(t1);
+                DatagramPacket packet = new DatagramPacket(pkt, pkt.length, addr, 123);
+                socket.send(packet);
+                byte[] rx = new byte[48];
+                DatagramPacket response = new DatagramPacket(rx, rx.length);
+                socket.receive(response);
+                if (rx.length >= 48) {
+                    double t4u = System.currentTimeMillis() / 1000.0;
+                    leap[0] = (rx[0] >> 6) & 0x3;
+                    stratum[0] = rx[1] & 0xff;
+                    long t1r = ByteBuffer.wrap(rx, 24, 8).getLong();
+                    long t2r = ByteBuffer.wrap(rx, 32, 8).getLong();
+                    long t3r = ByteBuffer.wrap(rx, 40, 8).getLong();
+                    double t1d = fromNtpTs(t1r), t2d = fromNtpTs(t2r), t3d = fromNtpTs(t3r), t4d = t4u;
+                    if (Math.abs(t1d - t1u) < 2.0) {
+                        thetaMs[0] = ((t2d - t1d) + (t3d - t4d)) * 500.0;
+                        delayMs[0] = ((t4d - t1d) - (t3d - t2d)) * 1000.0;
+                        return delayMs[0] > 0 && delayMs[0] < 800 && Math.abs(thetaMs[0]) < 2000
+                                && stratum[0] > 0 && stratum[0] < 16 && leap[0] != 3;
+                    }
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+            return false;
+        }
+
+        void start() {
+            if (thread != null) return;
+            enabled = true;
+            thread = new Thread(() -> {
+                while (enabled) {
+                    double minDelay = Double.MAX_VALUE;
+                    String bestHost = "";
+                    double bestTheta = 0;
+                    int bestStratum = 0, bestLeap = 0;
+                    boolean any = false;
+                    for (String host : hosts) {
+                        double[] thetaMs = new double[1];
+                        double[] delayMs = new double[1];
+                        int[] stratum = new int[1];
+                        int[] leap = new int[1];
+                        if (queryOneAddr(host, thetaMs, delayMs, stratum, leap)) {
+                            if (delayMs[0] < minDelay) {
+                                minDelay = delayMs[0];
+                                bestTheta = thetaMs[0];
+                                bestHost = host;
+                                bestStratum = stratum[0];
+                                bestLeap = leap[0];
+                                any = true;
+                            }
+                        }
+                    }
+                    if (any) {
+                        pushFilter(bestTheta, minDelay, bestHost);
+                        this.stratum = bestStratum;
+                        this.leap = bestLeap;
+                        lastOk = System.currentTimeMillis();
+                    }
+                    long age = System.currentTimeMillis() - lastOk;
+                    locked = any && age <= 10000 && dispMs <= 1.5;
+                    int pollMs = (int) Math.max(2000, Math.min(64000, 2000 + delayMs * 20));
+                    try {
+                        Thread.sleep(pollMs);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+                }
+            });
+            thread.start();
+        }
+
+        void stop() {
+            enabled = false;
+            if (thread != null) {
+                thread.interrupt();
+                try {
+                    thread.join(1500);
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+                thread = null;
+            }
+        }
+    }
+
+    static class QpcSensor {
+        double fs = 4000.0;
+        int N = 2048;
+        List<Double> rb = new ArrayList<>();
+        int rbMask = 0;
+        long writeIdx = 0;
+        double emaDt = 0.0, alphaDt = 0.001, lastT = 0.0;
+        int mains = 50;
+        double conf = 0.0, phi = 0.0, mag1 = 0.0, mag2 = 0.0;
+        long lastSwitch = 0;
+        int holdMs = 5000;
+        Goertzel g50 = new Goertzel(), g60 = new Goertzel(), g100 = new Goertzel(), g120 = new Goertzel();
+        List<Double> win = new ArrayList<>();
+
+        void init() {
+            int rbSz = 8192;
+            rb = new ArrayList<>(rbSz);
+            for (int i = 0; i < rbSz; i++) rb.add(0.0);
+            rbMask = rbSz - 1;
+            lastT = System.nanoTime() / 1_000_000_000.0;
+            emaDt = 1.0 / fs;
+            writeIdx = 0;
+            win = new ArrayList<>(N);
+            for (int i = 0; i < N; i++) win.add(0.0);
+            g50.init(N, fs, 50.0);
+            g60.init(N, fs, 60.0);
+            g100.init(N, fs, 100.0);
+            g120.init(N, fs, 120.0);
+        }
+
+        void sampleFast() {
+            double t = System.nanoTime() / 1_000_000_000.0;
+            double dt = t - lastT;
+            if (dt <= 0) return;
+            lastT = t;
+            emaDt = (1.0 - alphaDt) * emaDt + alphaDt * dt;
+            double r = dt - emaDt;
+            int i = (int) (Interlocked.incrementAndGet(() -> writeIdx) & rbMask);
+            rb.set(i, r);
+        }
+
+        void dspTick() {
+            int lastRead = 0;
+            int wr = (int) writeIdx;
+            while (((wr - lastRead) & rbMask) >= N) {
+                for (int i = 0; i < N; i++) {
+                    int idx = (lastRead + i) & rbMask;
+                    win.set(i, rb.get(idx));
+                }
+                lastRead = (lastRead + N) & rbMask;
+                for (int i = 0; i < N; i++) {
+                    win.set(i, win.get(i) * 0.5 * (1 - Math.cos(2 * Math.PI * i / (N - 1))));
+                }
+                for (int i = 0; i < N; i++) {
+                    g50.push(win.get(i));
+                    g60.push(win.get(i));
+                    g100.push(win.get(i));
+                    g120.push(win.get(i));
+                }
+                double[] re = new double[1], im = new double[1], mag50 = new double[1], phi50 = new double[1];
+                double[] mag60 = new double[1], phi60 = new double[1], mag100 = new double[1], phi100 = new double[1];
+                double[] mag120 = new double[1], phi120 = new double[1];
+                g50.result(re, im, mag50, phi50);
+                g60.result(re, im, mag60, phi60);
+                g100.result(re, im, mag100, phi100);
+                g120.result(re, im, mag120, phi120);
+                double e50 = mag50[0] + 0.5 * mag100[0];
+                double e60 = mag60[0] + 0.5 * mag120[0];
+                int cand = e60 > e50 ? 60 : 50;
+                double tot = e50 + e60;
+                if (tot < 1e-15) tot = 1e-15;
+                double c = cand == 60 ? e60 / tot : e50 / tot;
+                long now = System.currentTimeMillis();
+                if (cand != mains && c >= 0.65 && (now - lastSwitch) >= holdMs) {
+                    mains = cand;
+                    lastSwitch = now;
+                }
+                conf = c;
+                phi = mains == 50 ? phi50[0] : phi60[0];
+                mag1 = mains == 50 ? mag50[0] : mag60[0];
+                mag2 = mains == 50 ? mag100[0] : mag120[0];
+            }
+        }
+    }
+
+    static class Goertzel {
+        int N = 0;
+        double k = 0, w = 0, cw = 0, sw = 0, s1 = 0, s2 = 0;
+
+        void init(int n, double fs, double f) {
+            N = n;
+            k = Math.floor(0.5 + n * f / fs);
+            w = 2.0 * Math.PI * k / n;
+            cw = Math.cos(w);
+            sw = Math.sin(w);
+            s1 = s2 = 0;
+        }
+
+        void push(double x) {
+            double s = x + 2 * cw * s1 - s2;
+            s2 = s1;
+            s1 = s;
+        }
+
+        void result(double[] re, double[] im, double[] mag, double[] phi) {
+            re[0] = s1 - s2 * cw;
+            im[0] = s2 * sw;
+            mag[0] = Math.sqrt(re[0] * re[0] + im[0] * im[0]) / (N / 2.0);
+            phi[0] = Math.atan2(im[0], re[0]);
+            s1 = s2 = 0;
+        }
+    }
+
+    static class MainsEstimator {
+        double minConfLock = 0.70, minMagLock = 0.0012, outlierPhi = 0.35;
+        double aFast = 0.15, aSlow = 0.01, aFreq = 0.02;
+        double lockSecsMin = 20.0;
+        boolean locked = false;
+        double virtPhi = 0.0, virtFreq = 50.0, quality = 0.0, accumulatedS = 0.0, allanLike = 0.0;
+        double lastUnw = 0.0, emaFast = 0.0, emaSlow = 0.0;
+        boolean have = false;
+
+        static double unwrap(double prev, double now) {
+            double d = now - prev;
+            while (d > Math.PI) d -= 2.0 * Math.PI;
+            while (d < -Math.PI) d += 2.0 * Math.PI;
+            return prev + d;
+        }
+
+        void feed(double phi, int mains, double conf, double mag, double dtS) {
+            if (dtS <= 0) return;
+            double phiUnw = have ? unwrap(lastUnw, phi) : phi;
+            double w = 2.0 * Math.PI * mains;
+            if (have) {
+                double jump = Math.abs(phiUnw - lastUnw);
+                if (jump > outlierPhi && conf < 0.85) {
+                    lastUnw = phiUnw;
+                    return;
+                }
+            }
+            if (!have) {
+                emaFast = emaSlow = phiUnw;
+                have = true;
+            } else {
+                emaFast = (1.0 - aFast) * emaFast + aFast * phiUnw;
+                emaSlow = (1.0 - aSlow) * emaSlow + aSlow * phiUnw;
+            }
+            double dPhi = (phiUnw - lastUnw) / dtS;
+            double fInst = dPhi / (2.0 * Math.PI);
+            double fTarget = mains == 60 ? 60.0 : 50.0;
+            fInst = clamp(fInst, fTarget - 1.0, fTarget + 1.0);
+            virtFreq = (1.0 - aFreq) * virtFreq + aFreq * fInst;
+            double allanSamp = dPhi;
+            allanLike = 0.995 * allanLike + 0.005 * (allanSamp * allanSamp);
+            double qConf = clamp((conf - 0.50) / 0.40, 0.0, 1.0);
+            double qMag = clamp((mag - minMagLock) / (0.004 - minMagLock), 0.0, 1.0);
+            double qStab = Math.exp(-allanLike * 0.02);
+            quality = 0.50 * qConf + 0.30 * qMag + 0.20 * qStab;
+            if (conf >= minConfLock && mag >= minMagLock) {
+                accumulatedS += dtS;
+            } else {
+                accumulatedS = Math.max(0.0, accumulatedS - 0.1 * dtS);
+            }
+            locked = accumulatedS >= lockSecsMin && quality >= 0.65;
+            double mix = locked ? 0.25 : 0.60;
+            virtPhi = (1.0 - mix) * emaFast + mix * emaSlow;
+            lastUnw = phiUnw;
+        }
+    }
+
+    static class PLL {
+        double kp = 0.15, ki = 0.02, deadMs = 0.10, capPpm = 2000.0, slewPpmS = 180.0;
+        double integPpb = 0.0, livePpb = 0.0;
+        long last = 0;
+        double wSensor = 0.80, wNtp = 0.20;
+
+        void init() {
+            last = System.currentTimeMillis();
+        }
+
+        double tick(double phi, int mains, boolean ntpOk, double ntpMs) {
+            long now = System.currentTimeMillis();
+            double dt = (now - last) / 1000.0;
+            if (dt <= 0) dt = 0.02;
+            last = now;
+            double eMs = (phi / (2.0 * Math.PI * mains)) * 1000.0;
+            if (Math.abs(eMs) < deadMs) eMs = 0.0;
+            double conf = qpc.conf;
+            double qSensor = clamp((conf - 0.5) / 0.5, 0.0, 1.0);
+            double qNtp = ntpOk ? clamp(1.0 / (1.0 + ntp.delayMs / 20.0 + ntp.dispMs / 1.0), 0.1, 1.0) : 0.0;
+            double sumQ = qSensor + qNtp;
+            if (sumQ < 1e-6) sumQ = 1e-6;
+            wSensor = qSensor / sumQ;
+            wNtp = qNtp / sumQ;
+            double mix = wSensor * eMs + wNtp * ntpMs;
+            double eS = mix / 1000.0;
+            double dPpb = -(kp * eS + ki * eS * dt) * 1e9;
+            integPpb += dPpb;
+            double cap = capPpm * 1000.0;
+            if (integPpb > cap) integPpb = cap;
+            if (integPpb < -cap) integPpb = -cap;
+            double step = slewPpmS * 1000.0 * dt;
+            if (livePpb < integPpb) livePpb = Math.min(integPpb, livePpb + step);
+            else livePpb = Math.max(integPpb, livePpb - step);
+            return eMs;
+        }
+    }
+
+    static class EnvStats {
+        double eMae = 0, eRms2 = 0, magEma = 0, confEma = 0;
+        int n = 0;
+
+        void push(double eMs, double mag, double conf) {
+            eMae = 0.98 * eMae + 0.02 * Math.abs(eMs);
+            eRms2 = 0.98 * eRms2 + 0.02 * (eMs * eMs);
+            magEma = 0.98 * magEma + 0.02 * mag;
+            confEma = 0.98 * confEma + 0.02 * conf;
+            if (n < 1000000) n++;
+        }
+
+        double rms() {
+            return n > 0 ? Math.sqrt(eRms2) : 0;
+        }
+    }
+
+    static class Telemetry {
+        int mains = 50;
+        double conf = 0, phi = 0, mag1 = 0, mag2 = 0;
+        double eMs = 0, ppm = 0, ntpMs = 0;
+        boolean ntpOk = false;
+        double kp = 0, ki = 0, dead = 0, cap = 0, slew = 0;
+        double wS = 0, wN = 0;
+    }
+
+    static class Interlocked {
+        static long incrementAndGet(LongSupplier supplier) {
+            return supplier.getAsLong() + 1;
+        }
+    }
+
+    static double clamp(double x, double a, double b) {
+        return x < a ? a : (x > b ? b : x);
+    }
+}
